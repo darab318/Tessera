@@ -9,6 +9,7 @@ A lightweight photo viewer for Windows 10/11 that tiles any number of images and
 - **Fullscreen** (`F`, `F11` or double-click) shows only the images: no bars, no labels, and the cursor hides itself.
 - **Rotate** (`R` / `Shift+R`), **crop** (`C`, drag, `Enter`), **undo** (`Ctrl+Z`), **save** (`Ctrl+S`) or **save a copy** (`Ctrl+Shift+S`).
 - Respects phone-camera orientation (EXIF) automatically.
+- **Animated GIFs play**, in every tile at once. Rotate and crop apply to the whole animation; saving writes a still of the first frame.
 
 ## Setting it as your default photo viewer
 
@@ -26,7 +27,7 @@ No admin rights are needed. **Remove file associations** in the same menu undoes
 
 ## Formats
 
-Built in: JPEG, PNG, BMP, GIF (first frame), TIFF, ICO, JPEG XR, DDS, TGA, PSD, HDR, PNM/PPM/PGM, QOI, and WebP on Windows 11.
+Built in: JPEG, PNG, BMP, GIF (animated GIFs play), TIFF, ICO, JPEG XR, DDS, TGA, PSD, HDR, PNM/PPM/PGM, QOI, and WebP on Windows 11.
 
 Windows provides these through free Microsoft Store extensions, which Tessera uses automatically once installed: HEIC (*HEIF Image Extensions* + *HEVC Video Extensions*), AVIF (*AV1 Video Extension*), JPEG XL (*JPEG XL Image Extension*), camera RAW (*Raw Image Extension*), WebP on Windows 10 (*WebP Image Extensions*). If one is missing, the tile tells you which to install.
 

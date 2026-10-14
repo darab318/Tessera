@@ -48,17 +48,18 @@ build.bat / build.sh
 
 - **utilities**: `Com<T>` smart pointer, file-type list `kExts` (drives both opening and registration), path helpers.
 - **pixels**: `Pixels` holds straight-alpha BGRA, top-down. `Remap()` implements the 8 EXIF orientations (6 = 90° CW, 8 = 90° CCW) and is also used for rotate.
-- **decoding**: `DecodeAny()` tries WIC (honours EXIF orientation), then QOI, then stb_image. It returns friendly errors naming the Microsoft Store extension needed for HEIC/AVIF/JXL/WebP/RAW.
+- **decoding**: `DecodeAny()` tries WIC (honours EXIF orientation), then QOI, then stb_image. It returns friendly errors naming the Microsoft Store extension needed for HEIC/AVIF/JXL/WebP/RAW. Animated GIFs go through `DecodeGifFrames()`, which composes every frame onto the logical screen (disposal 2/3 honoured) into `Pixels::more` + `Pixels::delays`. Over `kAnimBudget` (512 MB), or if damaged, they fall back to a still first frame.
 - **background loader**: thread pool (≤4, below-normal priority). Results come back via `WM_APP_LOADED` and are matched by `tileId` + `gen` so stale loads are dropped.
 - **app state**: `Tile` (one per open image: path, pixels, GPU chunks, view, undo stack, folder siblings) and the global `App g`.
 - **settings**: `HKCU\Software\Tessera\Settings` (Sync, Grid, Labels, window Placement).
 - **default-app registration**: everything under HKCU: ProgId `Tessera.Image`, `Applications\Tessera.exe`, `Software\Tessera\Capabilities`, `RegisteredApplications`. Windows doesn't let apps set themselves as default, so the app registers and then opens `ms-settings:defaultapps`. It self-registers on first run, or when the exe path changes (`IsRegisteredHere`). There are `--register` / `--unregister` CLI switches.
-- **device resources**: Direct2D HWND render target (+ `ID2D1DeviceContext` for the cubic interpolation mode). `BuildChunks()` uploads pixels as one or more bitmaps, split at the GPU max texture size. Once an *unedited* image is on the GPU, its CPU copy is freed; `EnsureCpu()` re-decodes from disk when an edit needs it.
+- **device resources**: Direct2D HWND render target (+ `ID2D1DeviceContext` for the cubic interpolation mode). `BuildChunks()` uploads pixels as one or more bitmaps, split at the GPU max texture size, for every animation frame (`Chunk::frame`). If the GPU runs out of room for all frames, it drops to a still first frame. Once an *unedited* image is on the GPU, its CPU copy is freed; `EnsureCpu()` re-decodes from disk when an edit needs it.
 - **view math**: per-tile `fit` / `zoom` / centre (`cx`, `cy` in image pixels). `FitZoom()` floors to an integer when ≥1. Offsets are rounded to whole device pixels so nearest-neighbour stays crisp. The `kLadder` zoom steps are integers above 1.
 - **layout**: tries every column count and picks the one that maximises total displayed image area. Rows can have different counts (the last row is the remainder).
 - **loading / folder navigation**: `OpenFiles()` expands folders. Arrow keys walk the focused tile's folder in natural (Explorer) sort order.
 - **editing**: rotate and crop produce new `Pixels`, with up to 4 undo steps per tile. `t.edits` drives the "•" unsaved marker and the save prompt.
 - **saving**: WIC encode to a temp file, then `MoveFileEx` replace. JPEG is written at 95% quality with metadata copied and orientation reset to 1. `PixelSource` is a zero-copy `IWICBitmapSource`. It can only write JPEG/PNG/BMP/TIFF; other formats get "save a copy".
+- **animation**: one timer (`kAnimTimer`) for all animated tiles, set for the next due frame by `ScheduleAnim()` after every render. It's killed when no animation is on screen or the window is minimised.
 - **rendering**: `Render()` → `DrawTile()` per tile (clip, checkerboard for alpha, chunks, pixel grid ≥800%, crop overlay, label) → status bar, toast, help overlay. Device loss (`D2DERR_RECREATE_TARGET`) drops GPU resources and reloads lazily.
 - **input**: wheel zooms the tile under the cursor (or all tiles with Sync). Left-drag pans, middle-click closes, right-click opens the context menu, double-click toggles fullscreen. Keyboard in `OnKey`. `WM_COPYDATA` receives files from a second instance.
 - **startup**: single instance through a named mutex plus `WM_COPYDATA`. When Explorer launches one process per selected file, files arriving within 1.5 s are added as tiles instead of replacing the view. This is how multi-select + Enter opens them together.
@@ -66,7 +67,7 @@ build.bat / build.sh
 ## Conventions
 
 - Plain Win32 + COM, C++17, no frameworks and no new dependencies without a strong reason. Everything stays in one exe.
-- Keep idle cost at zero: no timers or polling except the fullscreen cursor-hide and toast timers.
+- Keep idle cost at zero: no timers or polling except the fullscreen cursor-hide, toast and animation timers (the last only runs while an animated image is open).
 - All UI sizes are multiplied by `g.scale` (DPI / 96).
 - Never smooth when magnifying. Any new drawing path must use `NEAREST_NEIGHBOR` when zoom ≥ 1.
 - User-visible text is UK English and plain ("Can't open…", "Not enough memory…").
@@ -80,12 +81,12 @@ There are no automated tests. After a change, build, then check by hand on Windo
 - Zoom to 100%, 300% and 1600%: pixels must be hard-edged, with no seams between GPU chunks on huge images (>16k px).
 - Fullscreen shows nothing but images, the cursor hides after 1.5 s, and Esc exits.
 - Rotate, crop, undo, then save (and save a copy) for a JPEG with EXIF orientation 6. Reopen it and it should be upright.
-- Transparent PNG shows a checkerboard. Animated GIF shows its first frame.
+- Transparent PNG shows a checkerboard. Animated GIFs play at the right speed, including ones with transparency and partial-frame updates; rotate/crop keeps them animating. With only still images open, Task Manager shows 0% CPU.
 - Missing codec: a .heic without the Store extension shows the install hint in the tile.
 
 ## Known gaps / ideas (not started)
 
-- Animated GIF/WebP play only the first frame.
+- Animated WebP plays only the first frame (GIF animates). There is no pause or frame-step for animations.
 - No colour management: embedded ICC profiles are ignored, so wide-gamut photos look slightly off.
 - 16-bit and HDR images are reduced to 8-bit for display.
 - The folder list is read once per tile; files added later aren't seen until the tile changes folder.

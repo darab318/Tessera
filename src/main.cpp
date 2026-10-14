@@ -139,38 +139,53 @@ static std::vector<std::wstring> ListImagesInDir(const std::wstring& dir) {
 
 struct Pixels {
     UINT w = 0, h = 0;
-    std::vector<uint32_t> px; // straight-alpha BGRA, top-down
+    std::vector<uint32_t> px; // straight-alpha BGRA, top-down (the first frame if animated)
     bool alpha = false;
+    std::vector<std::vector<uint32_t>> more; // animation: frames after the first, same size
+    std::vector<UINT> delays;                // animation: ms per frame, one per frame; empty for a still image
+    int Frames() const { return 1 + (int)more.size(); }
+    const uint32_t* Frame(int i) const { return i <= 0 || i > (int)more.size() ? px.data() : more[i - 1].data(); }
 };
 
-// EXIF-orientation style remap. 6 = rotate 90 CW, 8 = rotate 90 CCW.
+static void RemapFrame(const uint32_t* sp, size_t W, size_t H, uint32_t* dp, size_t dw, size_t dh, int o) {
+    for (size_t dy = 0; dy < dh; dy++) {
+        uint32_t* row = dp + dy * dw;
+        switch (o) {
+        case 2: for (size_t dx = 0; dx < dw; dx++) row[dx] = sp[dy * W + (W - 1 - dx)]; break;
+        case 3: for (size_t dx = 0; dx < dw; dx++) row[dx] = sp[(H - 1 - dy) * W + (W - 1 - dx)]; break;
+        case 4: for (size_t dx = 0; dx < dw; dx++) row[dx] = sp[(H - 1 - dy) * W + dx]; break;
+        case 5: for (size_t dx = 0; dx < dw; dx++) row[dx] = sp[dx * W + dy]; break;
+        case 6: for (size_t dx = 0; dx < dw; dx++) row[dx] = sp[(H - 1 - dx) * W + dy]; break;
+        case 7: for (size_t dx = 0; dx < dw; dx++) row[dx] = sp[(H - 1 - dx) * W + (W - 1 - dy)]; break;
+        case 8: for (size_t dx = 0; dx < dw; dx++) row[dx] = sp[dx * W + (W - 1 - dy)]; break;
+        default: memcpy(row, sp + dy * W, dw * 4); break;
+        }
+    }
+}
+
+// EXIF-orientation style remap, applied to every frame. 6 = rotate 90 CW, 8 = rotate 90 CCW.
 static std::unique_ptr<Pixels> Remap(const Pixels& s, int o) {
     auto d = std::make_unique<Pixels>();
     bool swap = o >= 5 && o <= 8;
     d->w = swap ? s.h : s.w;
     d->h = swap ? s.w : s.h;
     d->alpha = s.alpha;
+    d->delays = s.delays;
     d->px.resize((size_t)d->w * d->h);
-    const size_t W = s.w, H = s.h;
-    const uint32_t* sp = s.px.data();
-    for (size_t dy = 0; dy < d->h; dy++) {
-        uint32_t* row = &d->px[dy * d->w];
-        switch (o) {
-        case 2: for (size_t dx = 0; dx < d->w; dx++) row[dx] = sp[dy * W + (W - 1 - dx)]; break;
-        case 3: for (size_t dx = 0; dx < d->w; dx++) row[dx] = sp[(H - 1 - dy) * W + (W - 1 - dx)]; break;
-        case 4: for (size_t dx = 0; dx < d->w; dx++) row[dx] = sp[(H - 1 - dy) * W + dx]; break;
-        case 5: for (size_t dx = 0; dx < d->w; dx++) row[dx] = sp[dx * W + dy]; break;
-        case 6: for (size_t dx = 0; dx < d->w; dx++) row[dx] = sp[(H - 1 - dx) * W + dy]; break;
-        case 7: for (size_t dx = 0; dx < d->w; dx++) row[dx] = sp[(H - 1 - dx) * W + (W - 1 - dy)]; break;
-        case 8: for (size_t dx = 0; dx < d->w; dx++) row[dx] = sp[dx * W + (W - 1 - dy)]; break;
-        default: memcpy(row, sp + dy * W, d->w * 4); break;
-        }
+    RemapFrame(s.px.data(), s.w, s.h, d->px.data(), d->w, d->h, o);
+    for (auto& f : s.more) {
+        d->more.emplace_back((size_t)d->w * d->h);
+        RemapFrame(f.data(), s.w, s.h, d->more.back().data(), d->w, d->h, o);
     }
     return d;
 }
 
 static bool ScanAlpha(const Pixels& p) {
-    for (uint32_t v : p.px) if ((v >> 24) != 0xFF) return true;
+    size_t n = (size_t)p.w * p.h;
+    for (int i = 0; i < p.Frames(); i++) {
+        const uint32_t* f = p.Frame(i);
+        for (size_t k = 0; k < n; k++) if ((f[k] >> 24) != 0xFF) return true;
+    }
     return false;
 }
 
@@ -191,6 +206,69 @@ static bool ReadWholeFile(const std::wstring& path, std::vector<uint8_t>& buf) {
     return ok;
 }
 
+static UINT MetaUInt(IWICMetadataQueryReader* q, const wchar_t* name, UINT def) {
+    UINT r = def;
+    PROPVARIANT v; PropVariantInit(&v);
+    if (q && SUCCEEDED(q->GetMetadataByName(name, &v))) {
+        if (v.vt == VT_UI1) r = v.bVal;
+        else if (v.vt == VT_UI2) r = v.uiVal;
+        else if (v.vt == VT_UI4) r = v.ulVal;
+    }
+    PropVariantClear(&v);
+    return r;
+}
+
+// Every frame is kept fully composed, so cap the total; bigger animations show their first frame.
+static const uint64_t kAnimBudget = 512ull * 1024 * 1024;
+
+// Composes an animated GIF's frames onto its logical screen, honouring each frame's disposal.
+// Returns false (out left for the caller to reset) when it should be shown as a still image.
+static bool DecodeGifFrames(IWICBitmapDecoder* dec, UINT n, Pixels& out) {
+    Com<IWICMetadataQueryReader> gq;
+    dec->GetMetadataQueryReader(&gq);
+    UINT W = MetaUInt(gq, L"/logscrdesc/Width", 0), H = MetaUInt(gq, L"/logscrdesc/Height", 0);
+    if (!W || !H || (uint64_t)W * H * 4 * n > kAnimBudget) return false;
+    std::vector<uint32_t> canvas((size_t)W * H, 0), saved, fp;
+    out.w = W; out.h = H;
+    int prevDisp = 0;
+    WICRect prev{};
+    for (UINT i = 0; i < n; i++) {
+        Com<IWICBitmapFrameDecode> fr;
+        Com<IWICBitmapSource> conv;
+        if (FAILED(dec->GetFrame(i, &fr)) || FAILED(WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, fr, &conv)))
+            break; // a damaged frame ends the animation; keep what decoded
+        Com<IWICMetadataQueryReader> q;
+        fr->GetMetadataQueryReader(&q);
+        UINT fw = 0, fh = 0;
+        conv->GetSize(&fw, &fh);
+        WICRect r = {(INT)MetaUInt(q, L"/imgdesc/Left", 0), (INT)MetaUInt(q, L"/imgdesc/Top", 0), (INT)fw, (INT)fh};
+        int disp = (int)MetaUInt(q, L"/grctlext/Disposal", 0);
+        fp.resize((size_t)fw * fh);
+        if (fw && fh && FAILED(conv->CopyPixels(nullptr, fw * 4, fw * fh * 4, (BYTE*)fp.data()))) break;
+
+        // Undo the previous frame as it asked: 2 = clear its area, 3 = restore what was under it.
+        if (prevDisp == 2) {
+            for (INT y = std::max(0, prev.Y); y < std::min((INT)H, prev.Y + prev.Height); y++)
+                for (INT x = std::max(0, prev.X); x < std::min((INT)W, prev.X + prev.Width); x++) canvas[(size_t)y * W + x] = 0;
+        } else if (prevDisp == 3 && !saved.empty()) canvas.swap(saved);
+        if (disp == 3) saved = canvas;
+
+        for (INT y = 0; y < (INT)fh && r.Y + y < (INT)H; y++)
+            for (INT x = 0; x < (INT)fw && r.X + x < (INT)W; x++) {
+                uint32_t v = fp[(size_t)y * fw + x];
+                if (v >> 24) canvas[(size_t)(r.Y + y) * W + r.X + x] = v;
+            }
+        UINT d = MetaUInt(q, L"/grctlext/Delay", 0); // hundredths of a second; 0-1 means "fast", which browsers show at 100 ms
+        out.delays.push_back(d <= 1 ? 100 : d * 10);
+        if (i == 0) out.px = canvas; else out.more.push_back(canvas);
+        prevDisp = disp;
+        prev = r;
+    }
+    if (out.delays.size() < 2) return false;
+    out.alpha = ScanAlpha(out);
+    return true;
+}
+
 static bool DecodeWIC(IWICImagingFactory* f, const std::wstring& path, Pixels& out, std::wstring& fmt, GUID& cont,
                       std::wstring& err) {
     Com<IWICBitmapDecoder> dec;
@@ -209,6 +287,13 @@ static bool DecodeWIC(IWICImagingFactory* f, const std::wstring& path, Pixels& o
             if (k != std::wstring::npos) s.resize(k);
             fmt = s;
         }
+    }
+    UINT nFrames = 0;
+    if (cont == GUID_ContainerFormatGif && SUCCEEDED(dec->GetFrameCount(&nFrames)) && nFrames > 1) {
+        bool anim = false;
+        try { anim = DecodeGifFrames(dec, nFrames, out); } catch (...) {}
+        if (anim) return true;
+        out = Pixels(); // too big or damaged: fall back to the first frame as a still
     }
     Com<IWICBitmapFrameDecode> fr;
     if (FAILED(dec->GetFrame(0, &fr))) { err = L"The file has no readable image frame."; return false; }
@@ -368,7 +453,7 @@ class Loader {
 
 // ---------------------------------------------------------------- app state
 
-struct Chunk { int x, y, w, h; Com<ID2D1Bitmap> bmp; };
+struct Chunk { int x, y, w, h; int frame = 0; Com<ID2D1Bitmap> bmp; };
 
 struct Tile {
     int id = 0, gen = 0;
@@ -384,7 +469,9 @@ struct Tile {
     bool fit = true; float zoom = 1, cx = 0, cy = 0;
     D2D1_RECT_F cell{};
     std::vector<std::wstring> sibs; int sibIdx = -1; bool sibsLoaded = false;
+    std::vector<UINT> delays; int frame = 0; DWORD due = 0; // animation; delays is empty for a still image
     bool HasImage() const { return w > 0 && h > 0; }
+    bool Animated() const { return delays.size() > 1; }
 };
 
 struct CropState {
@@ -615,7 +702,7 @@ static void CreateTextFormats() {
     mk(g_tfHelp, 13.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, false);
 }
 
-// Upload CPU pixels into one or more GPU bitmaps.
+// Upload CPU pixels into one or more GPU bitmaps, for every frame of an animation.
 static void BuildChunks(Tile& t) {
     t.chunks.clear();
     if (!t.cpu) return;
@@ -624,38 +711,51 @@ static void BuildChunks(Tile& t) {
     D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, p.alpha ? D2D1_ALPHA_MODE_PREMULTIPLIED : D2D1_ALPHA_MODE_IGNORE), 96, 96);
     std::vector<uint32_t> tmp;
-    for (int y = 0; y < (int)p.h; y += maxs) {
-        for (int x = 0; x < (int)p.w; x += maxs) {
-            Chunk c;
-            c.x = x; c.y = y;
-            c.w = std::min(maxs, (int)p.w - x);
-            c.h = std::min(maxs, (int)p.h - y);
-            const void* src = &p.px[(size_t)y * p.w + x];
-            UINT32 pitch = p.w * 4;
-            if (p.alpha) {
-                try { tmp.resize((size_t)c.w * c.h); } catch (...) { t.gpuFail = true; t.chunks.clear(); return; }
-                for (int yy = 0; yy < c.h; yy++) {
-                    const uint32_t* s = &p.px[(size_t)(y + yy) * p.w + x];
-                    uint32_t* d = &tmp[(size_t)yy * c.w];
-                    for (int xx = 0; xx < c.w; xx++) {
-                        uint32_t v = s[xx], a = v >> 24;
-                        if (a == 255) { d[xx] = v; continue; }
-                        uint32_t b = ((v & 255) * a + 127) / 255, gg = (((v >> 8) & 255) * a + 127) / 255,
-                                 r = (((v >> 16) & 255) * a + 127) / 255;
-                        d[xx] = b | (gg << 8) | (r << 16) | (a << 24);
+    for (int f = 0; f < p.Frames(); f++) {
+        const uint32_t* fp = p.Frame(f);
+        for (int y = 0; y < (int)p.h; y += maxs) {
+            for (int x = 0; x < (int)p.w; x += maxs) {
+                Chunk c;
+                c.x = x; c.y = y; c.frame = f;
+                c.w = std::min(maxs, (int)p.w - x);
+                c.h = std::min(maxs, (int)p.h - y);
+                const void* src = &fp[(size_t)y * p.w + x];
+                UINT32 pitch = p.w * 4;
+                if (p.alpha) {
+                    try { tmp.resize((size_t)c.w * c.h); } catch (...) { t.gpuFail = true; t.chunks.clear(); return; }
+                    for (int yy = 0; yy < c.h; yy++) {
+                        const uint32_t* s = &fp[(size_t)(y + yy) * p.w + x];
+                        uint32_t* d = &tmp[(size_t)yy * c.w];
+                        for (int xx = 0; xx < c.w; xx++) {
+                            uint32_t v = s[xx], a = v >> 24;
+                            if (a == 255) { d[xx] = v; continue; }
+                            uint32_t b = ((v & 255) * a + 127) / 255, gg = (((v >> 8) & 255) * a + 127) / 255,
+                                     r = (((v >> 16) & 255) * a + 127) / 255;
+                            d[xx] = b | (gg << 8) | (r << 16) | (a << 24);
+                        }
                     }
+                    src = tmp.data();
+                    pitch = c.w * 4;
                 }
-                src = tmp.data();
-                pitch = c.w * 4;
+                if (FAILED(g_rt->CreateBitmap(D2D1::SizeU(c.w, c.h), src, pitch, &bp, &c.bmp))) {
+                    t.chunks.clear();
+                    if (p.Frames() > 1) { // no room for every frame: show the first one as a still
+                        t.cpu->more.clear();
+                        t.cpu->delays.clear();
+                        t.delays.clear();
+                        t.frame = 0;
+                        Toast(L"Not enough video memory to animate this image, so it shows the first frame");
+                        BuildChunks(t);
+                        return;
+                    }
+                    t.gpuFail = true;
+                    return;
+                }
+                t.chunks.push_back(std::move(c));
             }
-            if (FAILED(g_rt->CreateBitmap(D2D1::SizeU(c.w, c.h), src, pitch, &bp, &c.bmp))) {
-                t.gpuFail = true;
-                t.chunks.clear();
-                return;
-            }
-            t.chunks.push_back(std::move(c));
         }
     }
+    if (t.Animated()) t.due = GetTickCount() + t.delays[t.frame];
     // Unedited images don't need a CPU copy once they're on the GPU; re-read from disk on demand.
     if (t.edits == 0 && t.undo.empty()) t.cpu.reset();
 }
@@ -820,6 +920,7 @@ static bool EnsureCpu(Tile& t) {
     if (!ok) { MessageBoxW(g.hwnd, (L"Couldn't re-read the image:\n" + err).c_str(), kAppName, MB_ICONWARNING); return false; }
     if (p->w != t.w || p->h != t.h) { t.w = p->w; t.h = p->h; t.fit = true; t.chunks.clear(); }
     t.alpha = p->alpha;
+    if (p->delays.size() != t.delays.size()) { t.delays = p->delays; t.frame = 0; t.chunks.clear(); }
     t.cpu = std::move(p);
     return true;
 }
@@ -899,12 +1000,14 @@ static void OnLoaded(LoadResult* r) {
     if (r->px) {
         bool sameSize = t->w == r->px->w && t->h == r->px->h;
         t->w = r->px->w; t->h = r->px->h; t->alpha = r->px->alpha;
+        t->delays = r->px->delays; t->frame = 0;
         t->cpu = std::move(r->px);
         t->fmt = r->fmt; t->cont = r->cont; t->err.clear();
         if (!sameSize) t->fit = true;
     } else {
         t->cpu.reset();
         t->w = t->h = 0;
+        t->delays.clear(); t->frame = 0;
         t->err = r->err;
         t->fmt.clear();
     }
@@ -958,6 +1061,8 @@ static void PushEdit(Tile& t, std::unique_ptr<Pixels> next) {
     if (t.undo.size() > 4) t.undo.erase(t.undo.begin());
     t.cpu = std::move(next);
     t.w = t.cpu->w; t.h = t.cpu->h; t.alpha = t.cpu->alpha;
+    t.delays = t.cpu->delays;
+    if (t.frame >= t.cpu->Frames()) t.frame = 0;
     t.chunks.clear();
     t.gpuFail = false;
     t.edits++;
@@ -983,6 +1088,8 @@ static void UndoTile(Tile& t) {
     t.cpu = std::move(t.undo.back());
     t.undo.pop_back();
     t.w = t.cpu->w; t.h = t.cpu->h; t.alpha = t.cpu->alpha;
+    t.delays = t.cpu->delays;
+    if (t.frame >= t.cpu->Frames()) t.frame = 0;
     t.chunks.clear();
     t.edits--;
     t.fit = true;
@@ -1023,9 +1130,14 @@ static void ApplyCrop() {
     auto np = std::make_unique<Pixels>();
     try {
         np->w = x1 - x0; np->h = y1 - y0;
-        np->px.resize((size_t)np->w * np->h);
-        for (int y = y0; y < y1; y++)
-            memcpy(&np->px[(size_t)(y - y0) * np->w], &t->cpu->px[(size_t)y * t->cpu->w + x0], (size_t)np->w * 4);
+        np->delays = t->cpu->delays;
+        auto cut = [&](const std::vector<uint32_t>& src, std::vector<uint32_t>& dst) {
+            dst.resize((size_t)np->w * np->h);
+            for (int y = y0; y < y1; y++)
+                memcpy(&dst[(size_t)(y - y0) * np->w], &src[(size_t)y * t->cpu->w + x0], (size_t)np->w * 4);
+        };
+        cut(t->cpu->px, np->px);
+        for (auto& f : t->cpu->more) { np->more.emplace_back(); cut(f, np->more.back()); }
         np->alpha = ScanAlpha(*np);
     } catch (...) { MessageBoxW(g.hwnd, L"Not enough memory to crop.", kAppName, MB_ICONWARNING); return; }
     PushEdit(*t, std::move(np));
@@ -1182,7 +1294,8 @@ static bool SaveTile(Tile& t, bool saveAs) {
     bool canOverwrite = ContainerForExt(LowerExt(t.path), cont);
     if (saveAs || !canOverwrite) {
         if (!saveAs && !canOverwrite)
-            MessageBoxW(g.hwnd, (L"Tessera can't write " + LowerExt(t.path) + L" files, so it will save a copy instead.").c_str(),
+            MessageBoxW(g.hwnd, (L"Tessera can't write " + LowerExt(t.path) + L" files, so it will save a copy instead." +
+                                 (t.Animated() ? L"\n\nThe copy is a still image of the first frame." : L"")).c_str(),
                         kAppName, MB_ICONINFORMATION);
         if (!AskSavePath(t, out)) return false;
         if (!ContainerForExt(LowerExt(out), cont)) return false;
@@ -1216,9 +1329,11 @@ static bool SaveTile(Tile& t, bool saveAs) {
     t.cont = cont;
     t.edits = 0;
     t.undo.clear();
-    DropCpuIfClean(t);
+    bool anim = t.Animated();
+    if (anim) StartLoad(t, true); // the saved file is a still image: show what was written
+    else DropCpuIfClean(t);
     UpdateTitle();
-    Toast(L"Saved " + FileName(out));
+    Toast(L"Saved " + FileName(out) + (anim ? L" (first frame only)" : L""));
     return true;
 }
 
@@ -1233,7 +1348,7 @@ static void CopyToClipboard(Tile& t) {
     bi->biSize = sizeof(*bi); bi->biWidth = p.w; bi->biHeight = p.h; bi->biPlanes = 1;
     bi->biBitCount = 32; bi->biCompression = BI_RGB; bi->biSizeImage = (DWORD)bytes;
     uint8_t* dst = (uint8_t*)(bi + 1);
-    for (UINT y = 0; y < p.h; y++) memcpy(dst + (size_t)y * p.w * 4, &p.px[(size_t)(p.h - 1 - y) * p.w], (size_t)p.w * 4);
+    for (UINT y = 0; y < p.h; y++) memcpy(dst + (size_t)y * p.w * 4, p.Frame(t.frame) + (size_t)(p.h - 1 - y) * p.w, (size_t)p.w * 4);
     GlobalUnlock(hg);
     if (OpenClipboard(g.hwnd)) {
         EmptyClipboard();
@@ -1370,6 +1485,7 @@ static void DrawTile(Tile& t, int idx) {
         }
         bool nearest = v.z >= 0.999f;
         for (auto& c : t.chunks) {
+            if (c.frame != t.frame) continue;
             float ix0 = std::max<float>(c.x, std::floor((cell.left - v.ox) / v.z));
             float ix1 = std::min<float>(c.x + c.w, std::ceil((cell.right - v.ox) / v.z));
             float iy0 = std::max<float>(c.y, std::floor((cell.top - v.oy) / v.z));
@@ -1449,6 +1565,7 @@ static void DrawStatus(float W, float H) {
         if (f->HasImage()) {
             left += Fmt(L"     %u × %u", f->w, f->h);
             if (!f->fmt.empty()) left += L"     " + f->fmt;
+            if (f->Animated()) left += Fmt(L"  (%d frames)", (int)f->delays.size());
             left += Fmt(L"     %d%%", (int)std::round(GetView(*f).z * 100));
         }
         if (f->sibsLoaded && f->sibIdx >= 0 && f->sibs.size() > 1) left += Fmt(L"     %d / %d", f->sibIdx + 1, (int)f->sibs.size());
@@ -1514,6 +1631,40 @@ static void DrawHelp(float W, float H) {
     }
 }
 
+// ---------------------------------------------------------------- animation
+
+// One timer drives every animated tile, set for whichever frame is due next. It only exists while an
+// animation is on screen, so a window of still images stays at zero CPU.
+static const UINT_PTR kAnimTimer = 3;
+
+static void ScheduleAnim() {
+    DWORD now = GetTickCount();
+    LONG next = -1;
+    for (auto& t : g.tiles) {
+        if (!t->Animated() || t->chunks.empty()) continue;
+        LONG left = std::max<LONG>(1, (LONG)(t->due - now));
+        if (next < 0 || left < next) next = left;
+    }
+    if (next < 0 || IsIconic(g.hwnd)) KillTimer(g.hwnd, kAnimTimer);
+    else SetTimer(g.hwnd, kAnimTimer, (UINT)next, nullptr);
+}
+
+static void AdvanceAnim() {
+    DWORD now = GetTickCount();
+    bool changed = false;
+    for (auto& t : g.tiles) {
+        if (!t->Animated() || t->chunks.empty()) continue;
+        if ((LONG)(now - t->due) > 1000) t->due = now; // fell far behind (e.g. during a dialog): don't race to catch up
+        while ((LONG)(now - t->due) >= 0) {
+            t->frame = (t->frame + 1) % (int)t->delays.size();
+            t->due += t->delays[t->frame];
+            changed = true;
+        }
+    }
+    if (changed) Redraw();
+    ScheduleAnim();
+}
+
 static void Render() {
     if (!EnsureDevice()) return;
     RECT rc; GetClientRect(g.hwnd, &rc);
@@ -1543,6 +1694,7 @@ static void Render() {
     if (g.help) DrawHelp(W, H);
     HRESULT hr = g_rt->EndDraw();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) { ReleaseDeviceResources(); Redraw(); }
+    ScheduleAnim();
 }
 
 // ---------------------------------------------------------------- crop interaction
@@ -2007,7 +2159,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == 2) {
             KillTimer(hwnd, 2);
             Redraw();
-        }
+        } else if (wp == kAnimTimer) AdvanceAnim();
         return 0;
     case WM_CLOSE:
         if (!ConfirmDiscardAll()) return 0;
